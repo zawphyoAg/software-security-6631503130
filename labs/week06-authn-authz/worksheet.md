@@ -10,19 +10,26 @@
 
 | Name | Student ID | Date | Group |
 |------|-----------|------|-------|
-|      |           |      |       |
+|    ZAW PHYO AUNG  | 6631503130          |  11.9.2026    |       |
 
 ![Diagram of one request passing two gates: Gate 1 authentication accepts an alg:none forgery, a weak-secret forgery, and alice's real token, then Gate 2 authorization fails to check ownership so alice's valid token reads bob's /api/orders/2 as IDOR, with the solution_app.py fixes for both.](img/authn-vs-authz.svg)
 
 ## Part 2 — Lecture Questions
 
-Answer in 2–4 sentences each.
+1. **Authentication vs. Authorization:**
+Authentication verifies *who* you are (proving identity, typically via credentials or a token). Authorization verifies *what you're allowed to do* once your identity is known (checking permissions against a specific resource or action). In `get_order`, calling `current_user()` establishes *who* is making the request (authentication succeeds), but the function then ignores that result and never checks whether the identified user actually owns the requested order — so **authorization** is the piece that's missing.
 
-1. Distinguish **authentication** from **authorization**. In `vulnerable_app.py`, `get_order` calls `current_user()` but ignores its result (L63) — which of the two is missing?
-2. What is **IDOR** (CWE-639)? Why is `/api/orders/<oid>` exploitable, and what single check in `solution_app.py` (L64) closes it?
-3. Explain the **`alg:none`** JWT attack. Why does listing `"none"` in `algorithms=[...]` (L55) let an attacker submit an *unsigned* token?
-4. Why is the hardcoded HMAC secret `"secret"` (CWE-321) dangerous even if `alg:none` were disabled? How does a strong random secret + pinned algorithm defend the token?
-5. What do the JWT claims **`exp`** and **`aud`** add, and why does the secure version reject tokens that lack them?
+2. **IDOR (CWE-639):**
+IDOR (Insecure Direct Object Reference) happens when an application exposes a direct, unvalidated reference to an internal object — like a sequential ID — and lets any authenticated user access any object just by changing that ID, without checking they're actually entitled to it. `/api/orders/<oid>` is exploitable because `oid` is a simple, guessable integer, and the endpoint only checks that a valid token was presented, never that the token's owner matches the order being requested. The single check that closes it (L64 in `solution_app.py`) compares the authenticated user's identity against the order's actual owner field, rejecting the request with 403 if they don't match.
+
+3. **The alg:none attack:**
+JWTs store their signing algorithm inside the token's own header, and libraries that support the `"none"` algorithm will treat a token as valid without checking any signature at all if that's what the header claims. If the server's verification call includes `"none"` in its accepted `algorithms=[...]` list (L55), it explicitly tells the JWT library "a token claiming no signature is acceptable" — so an attacker can hand-craft a token with any payload they want (e.g., `{"sub": "bob"}`), set the header to `alg: none`, submit it with an empty signature, and the server will accept it as if it were legitimately issued, because it never even attempts to verify anything cryptographically.
+
+4. **Why the hardcoded secret is dangerous even without alg:none:**
+Even if `alg:none` is disabled, HS256 signatures are only as strong as the secret key used to create them — and `"secret"` is a common dictionary word, trivial to guess or find in any wordlist. Since HS256 is symmetric (the same key signs and verifies), anyone who obtains or guesses that key can forge perfectly valid, correctly-signed tokens for any user they choose. A strong, long, randomly-generated secret makes brute-forcing computationally infeasible, and pinning the algorithm ensures an attacker can't sidestep verification entirely by switching to a weaker or bypassable algorithm in the first place — both protections are necessary together, since fixing only one still leaves the other attack path open.
+
+5. **The `exp` and `aud` claims:**
+`exp` (expiration) sets a time limit after which the token is no longer valid, so a token stolen or leaked today can't be replayed indefinitely — it eventually expires and forces re-authentication. `aud` (audience) restricts which service or endpoint the token is valid for, preventing a token issued for one purpose or application from being reused against a different, possibly more sensitive, endpoint. The secure version rejects tokens lacking either claim because their absence means the token has no built-in lifespan and no scope restriction — exactly the properties an attacker would want in a forged or stolen token to maximize its usefulness.
 
 ## Part 3 — Hands-on Lab (150 min)
 
@@ -52,73 +59,141 @@ docker run --rm -p 3000:3000 bkimminich/juice-shop       # -> http://localhost:3
 
 ---
 
-**Task 0 — Onboarding (5 min).** Get alice's token (from `attack.md`):
-```bash
+Task 0 — Onboarding
+
+Retrieved alice's token via:
 TOKEN=$(curl -s -X POST http://localhost:8080/login \
   -H 'Content-Type: application/json' \
   -d '{"user":"alice","pw":"alicepw"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-echo "$TOKEN"
-```
-Confirm `/api/orders/1` returns alice's Laptop order. *Deliverable: screenshot of the token + order 1.*
 
-**Task 1 — IDOR Treasure Hunt (30 min) 🗺️.**
-- *Goal:* read **bob's** order with **alice's** token.
-- *Steps:*
-  ```bash
-  curl -s http://localhost:8080/api/orders/1 -H "Authorization: Bearer $TOKEN"   # yours
-  curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $TOKEN"   # bob's — leaks!
-  ```
-- *Deliverable:* both responses + screenshot of bob's `Phone` order + why the missing ownership check (CWE-639) is the root cause.
+Token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSJ9.c3brGQkxoiCgrl5LGiV0go9qgN0MtrdnDBCCfJ45f_Q
 
-```sim
-jwt-forge
-```
+Confirmed /api/orders/1 returns alice's own order:
+{
+  "item": "Laptop",
+  "owner": "alice",
+  "total": 1200
+}
 
-**Task 2 — JWT Forgery via alg:none (30 min) 🔏.**
-- *Goal:* impersonate bob with an **unsigned** token (no secret needed).
-- *Steps:*
-  ```bash
-  FORGED=$(python3 - <<'PY'
-  import jwt
-  print(jwt.encode({"sub": "bob"}, key="", algorithm="none"))
-  PY
-  )
-  curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $FORGED"
-  ```
-- *Deliverable:* the forged token + screenshot of the accepted response + explanation of the `none` flaw (CWE-347).
+Screenshot: ![Task 0 - Onboarding](img/task0_onboarding_6631503130.png)
 
-**Task 3 — JWT Forgery via weak secret (30 min) 🔏.**
-- *Goal:* sign a *valid* HS256 token because the secret is the guessable string `secret` (CWE-321).
-- *Steps:*
-  ```bash
-  FORGED2=$(python3 - <<'PY'
-  import jwt
-  print(jwt.encode({"sub": "bob"}, "secret", algorithm="HS256"))
-  PY
-  )
-  curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $FORGED2"
-  ```
-- *Deliverable:* token + screenshot + 2–3 sentences on why secret strength + key management matter.
+Task 1 — IDOR Treasure Hunt
 
-**Task 4 — Privilege/identity escalation reasoning (25 min).**
-- *Goal:* combine the flaws. Using Task 2/3 you became `bob` *without his password*; using Task 1 you read objects you don't own.
-- *Steps:* document the full attack chain (forge token → access any `oid`). Optionally replay the requests through **Burp Suite Repeater** and screenshot the intercepted request/response.
-- *Deliverable:* a short chain diagram/paragraph + Burp (or curl) evidence.
+Commands used:
+curl -s http://localhost:8080/api/orders/1 -H "Authorization: Bearer $TOKEN"   # my own order
+curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $TOKEN"   # bob's order — leaked
 
-**Task 5 — Defend / fix it (30 min) 🛡️.**
-- *Goal:* prove `solution_app.py` blocks Tasks 1–3.
-- *Steps:* stop the vulnerable container (`Ctrl-C`), then:
-  ```bash
-  docker compose run --rm --service-ports authz-lab bash -c "pip install --no-cache-dir flask pyjwt && python solution_app.py"
-  ```
-  Re-run: get a fresh alice token, then re-fire each attack. Expected: `/api/orders/2` with alice's token → **403 forbidden** (ownership check, L64); the `alg:none` token → **401 invalid token** (algorithm pinned to HS256, L50); the `"secret"` token → **401** (strong random secret + required `aud`/`exp`, L10/40).
-- *Deliverable:* screenshots of the 403 and both 401s + name the fix line for each.
+Response for order 1 (mine):
+{
+  "item": "Laptop",
+  "owner": "alice",
+  "total": 1200
+}
+
+Response for order 2 (bob's, using MY token):
+{
+  "item": "Phone",
+  "note": "FLAG{idor_demo}",
+  "owner": "bob",
+  "total": 800
+}
+
+Why it works:
+The /api/orders/<id> endpoint only checks that the request has a VALID token — it never checks whether the token's owner actually matches the order being requested. Because the order ID is a simple, guessable, sequential integer, and there's no server-side check tying the requested order to the authenticated user, I could just increment the ID in the URL and read anyone's data. This is CWE-639 (Authorization Bypass Through User-Controlled Key / missing ownership check) — the server trusts that whatever ID is requested belongs to the token holder, when nothing actually enforces that relationship.
+
+Screenshot: ![Task 1 - IDOR](img/task1_idor_6631503130.png)
+
+Task 2 — JWT Forgery via alg:none
+
+Forged token generated:
+eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJib2IifQ.
+
+Command used:
+curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $FORGED"
+
+Result — server accepted the unsigned token and returned bob's order:
+{
+  "item": "Phone",
+  "note": "FLAG{idor_demo}",
+  "owner": "bob",
+  "total": 800
+}
+
+Why it works:
+JWTs include their signing algorithm inside the token header itself, and here the header specifies "alg": "none". If the server's verification code trusts that field and simply skips signature checking when it says "none", then anyone can construct a token claiming to be any user with zero knowledge of any secret key — since there is no signature to forge or crack, only to omit. This is CWE-347 (Improper Verification of Cryptographic Signature): the server never actually confirms the token was issued by a legitimate authority; it just parses whatever payload is handed to it as authoritative.
+
+Screenshot: ![Task 2 - JWT alg:none Forgery](img/task2_jwt_none_6631503130.png)
+
+
+Task 3 — JWT Forgery via Weak Secret
+
+Forged token generated:
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJib2IifQ.-51G5JQmpJleARHp8rIljBczPFanWT93d_N_7LQGUXU
+
+Command used:
+curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $FORGED2"
+
+Result — server accepted the token and returned bob's order:
+{
+  "item": "Phone",
+  "note": "FLAG{idor_demo}",
+  "owner": "bob",
+  "total": 800
+}
+
+Note: pyjwt itself warned that the 6-byte key "secret" is far below the recommended 32-byte minimum for HMAC-SHA256 (RFC 7518), confirming the key's weakness independently of the exploit succeeding.
+
+Why secret strength and key management matter:
+Unlike Task 2, this token is cryptographically valid — it passes real signature verification because the signing secret is a short, common dictionary word that's trivial to guess or brute-force offline. This is CWE-321 (Use of Hard-coded Cryptographic Key): once an attacker recovers or guesses the secret, they can forge tokens for ANY user, with a fully legitimate-looking signature that passes every check. A strong, long, randomly-generated secret (or better, asymmetric signing with RS256/ES256 where the server never even holds the private signing key in a guessable form) removes this attack surface entirely, since brute-forcing a properly random 256-bit key is computationally infeasible.
+
+Screenshot: ![Task 3 - JWT Weak Secret Forgery](img/task3_jwt_weak_secret_6631503130.png)
+
+Task 4 — Privilege/Identity Escalation Reasoning
+
+Attack chain:
+1. Forge identity (Task 2 or 3): Without ever knowing bob's password, I created a JWT claiming {"sub": "bob"} — either completely unsigned (alg:none) or signed with the guessed weak secret "secret". The server accepted both as proof of being bob.
+2. Exploit missing ownership check (Task 1): Once holding a token the server accepts as bob's, I requested /api/orders/2 — an endpoint that never verifies the token's subject actually matches the resource owner, just that SOME valid token was presented.
+3. Combined result: I fully impersonated bob's identity (via JWT forgery) AND accessed data that shouldn't be reachable even for a legitimate different user (via IDOR) — two independent flaws that compound into full account takeover of arbitrary users' data, without credentials, without permission, and without detection, since the forged tokens look like normal API traffic.
+
+This chain shows why authentication (proving who you are) and authorization (checking what you're allowed to do) must BOTH be enforced correctly. A break in either one alone is bad, but here neither check works, so an attacker only needs to defeat the weaker of the two (here, JWT verification) to walk straight through the second flaw (missing ownership check) as well.
+
+Evidence: curl commands and responses from Tasks 1–3, chained together to represent the same "become bob → read bob's data" outcome using three independent paths (IDOR alone with a legitimate token, alg:none forgery, and weak-secret forgery).
+
+Screenshot: ![Task 4 - Attack Chain](img/task4_privilege_escalation_6631503130.png)
+Task 5 — Defend / Fix It
+
+Stopped vulnerable_app.py and ran the fixed version:
+docker compose run --rm --service-ports authz-lab bash -c "pip install --no-cache-dir flask pyjwt && python solution_app.py"
+
+Got a fresh alice token, then re-fired all three attacks:
+
+1. IDOR (Task 1) — curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $TOKEN"
+   Result: {"error":"forbidden"}
+   Fix: server-side ownership check (approx. L64) — the endpoint now verifies that the authenticated user's identity (from the token) actually matches the order's owner field before returning any data, rejecting requests for resources the token holder doesn't own.
+
+2. alg:none forgery (Task 2) — curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $FORGED"
+   Result: {"error":"invalid token"}
+   Fix: algorithm pinned to HS256 (approx. L50) — the server now explicitly specifies which algorithm(s) it will accept during verification, rather than trusting the algorithm named in the token's own header. A token claiming "alg":"none" is rejected outright regardless of its payload.
+
+3. Weak-secret forgery (Task 3) — curl -s http://localhost:8080/api/orders/2 -H "Authorization: Bearer $FORGED2"
+   Result: {"error":"invalid token"}
+   Fix: strong random secret + required aud/exp claims (approx. L10, L40) — the signing secret is no longer a guessable word, so a token signed with "secret" no longer matches and fails signature verification. The added audience/expiration requirements also reject any token missing those claims, closing off replay of old or improperly-scoped tokens.
+
+Screenshots:
+![Task 5 - IDOR Defense](img/task5_defense_idor_6631503130.png)
+![Task 5 - alg:none Defense](img/task5_defense_alg_none_6631503130.png)
+![Task 5 - Weak Secret Defense](img/task5_defense_weak_secret_6631503130.png)
 
 ## Part 4 — Reflection
 
-1. **CWE/OWASP mapping:** map IDOR → **CWE-639 / A01**, the JWT forgeries → **CWE-347 & CWE-321 / A07**.
-2. **Real breach:** the **2022 Optus breach** exposed millions of customer records via an exposed/poorly-authorized API endpoint where identifiers could be enumerated — a textbook broken-access-control / IDOR-style failure. In 3–4 sentences connect it to Tasks 1 and 4 of this lab. *(Alternative: the Peloton API IDOR disclosure.)*
-3. **Best mitigation:** between deny-by-default ownership checks, pinning the JWT algorithm, and a strong managed secret, which control protects the most attack surface here, and why is server-side authorization non-negotiable?
+1. **CWE/OWASP mapping:**
+The IDOR vulnerability (Task 1) maps to CWE-639 (Authorization Bypass Through User-Controlled Key) and OWASP A01 (Broken Access Control) — the server never verified that the resource ID in the URL actually belonged to the requesting user. The two JWT forgeries (Tasks 2–3) map to CWE-347 (Improper Verification of Cryptographic Signature) and CWE-321 (Use of Hard-coded Cryptographic Key), both under OWASP A07 (Identification and Authentication Failures) — the server either skipped signature verification entirely or used a signing secret weak enough to guess.
+
+2. **Real breach:**
+The 2022 Optus breach exposed millions of customer records because an API endpoint allowed sequential, unauthenticated (or under-authorized) enumeration of customer identifiers, letting an attacker simply increment IDs to pull record after record — structurally identical to Task 1's IDOR, where incrementing the order ID in the URL leaked another user's data. Task 4's attack chain shows how this class of flaw escalates: once identity itself can be forged or bypassed (as in Tasks 2–3), an attacker doesn't even need a legitimate account to start enumerating, turning a single missing ownership check into full unauthorized access across the entire user base. Both cases show that access control cannot be assumed from authentication alone — a valid-looking request is not the same as an authorized one, and IDs that are sequential or guessable turn any missing check into an automatable data-harvesting bug at scale.
+
+3. **Best mitigation:**
+Of the three, deny-by-default ownership checks protect the most attack surface, because they're the last line of defense regardless of how identity was established — even if an attacker somehow forges a perfectly valid token (weak secret, stolen key, misconfigured trust), a correct ownership check still stops them from touching another user's data. Pinning the JWT algorithm and using a strong managed secret both harden authentication, but authentication only answers "who are you," while authorization answers "what are you allowed to do" — and Task 5 proved that even with authentication now airtight, the IDOR fix was a separate, independent control that had to be added on its own. This is why server-side authorization is non-negotiable: it's the only check that can't be bypassed just by defeating one weak link upstream, and skipping it means every future authentication improvement still leaves the door open.
 
 ## Grading rubric (100)
 
@@ -134,35 +209,25 @@ jwt-forge
 
 ## Evidence & Integrity (required)
 
-- **Identity proof:** every screenshot/diagram must show a terminal running `printf '%s | %s | ' "$(whoami)" '<YOUR-STUDENT-ID>'; date '+%F %T %Z'` **in the
-  same image as the evidence**. When the evidence is a browser page, a DevTools panel or a
-  rendered response, put that terminal **beside the browser and capture the whole screen** — a
-  cropped window carries nothing that identifies you, and the lab's own output is
-  byte-identical for the whole cohort *by design*, so the stamp is the only thing that makes
-  the shot yours. Generic or borrowed evidence is not accepted.
-- **Personalized flag (if this lab issues one):** ____________________
-  *Flags are unique per student — submitting another student's flag is a violation. How to submit: **learn.zcr.ai/submit** (full guide: `SUBMISSION.md` in the repo root).*
-- **Explain in your own words** *(graded on your reasoning, not copied text):*
-  1. What did you do, and **why did the vulnerability work**?
-  2. **Why does your fix actually stop it** — and what could still break it?
+- **Identity proof:** all screenshots include a terminal running `printf '%s | %s | ' "$(whoami)" '6631503130'; date '+%F %T %Z'` alongside the evidence, per task.
+- **Personalized flag:** FLAG{idor_demo}
+- **Explain in your own words:**
+  1. I forged a user's identity two different ways (an unsigned JWT and a JWT signed with a guessed weak secret), then exploited a missing ownership check on the /api/orders/<id> endpoint to read another user's order data. The vulnerability worked because the server trusted the token's claimed identity without verifying its signature properly in one case, and trusted a guessable secret in the other — and separately, it never checked that the order being requested actually belonged to the authenticated user at all.
+  2. The fix works because it adds two independent, mandatory checks: the server now pins the accepted signing algorithm (so "alg":"none" is rejected outright) and uses a strong secret with required claims (so guessing "secret" no longer produces a valid signature), AND it separately verifies resource ownership server-side before returning any data. What could still break it: if the new secret were ever leaked, checked into source control, or reused across environments, forgery would become possible again — strong secrets still need proper key management (rotation, secure storage) to stay effective, and any future endpoint added without the same ownership check would reintroduce IDOR independently of the authentication fix.
 
 ---
 
 ## 🤖 Audit the AI (required)
 
-AI is a power tool you must **distrust** — you are graded on your *critique*, not the AI's answer.
-
-1. Ask an AI assistant to exploit **or** fix this week's vulnerability. Paste its full answer.
-2. **Find what's wrong or risky** in it — insecure code, a subtly incomplete fix, a hallucinated API/function/CVE, a missed edge case, or wrong reasoning. Quote the exact line(s).
-3. Produce the **correct, verified** version yourself and explain in 2–3 sentences why the AI's output was insufficient.
-
-> Disclose your AI use in the Part 1 table. This task counts toward your **Defense + Reflection** score.
-
----
+[Paste your actual conversation with me here — specifically my Task 5 responses. Then critique something genuinely worth flagging, for example: I estimated line numbers like "L64", "L50", "L10/40" for the fixes without ever having seen solution_app.py's actual source code — I told you this directly when you asked. Quote that moment, explain why citing unverified line numbers is risky (it could be flatly wrong and cost you points, or worse, teach a false sense of precision), and show the corrected version — e.g., actually opening solution_app.py and quoting the real line numbers for each fix.]
 
 ## 🧠 Comprehension & Prompt (required)
 
-**A. Explain in Plain English (EiPE).** In 2–3 sentences, in your own words, describe what this week's vulnerable code/endpoint actually *does* and *why it is exploitable* — explain the mechanism, don't dump jargon.
+**A. Explain in Plain English (EiPE).**
+The /api/orders/<id> endpoint checks whether a request carries *any* valid-looking JWT, but never checks whether the token's owner is actually the person the requested order belongs to — and separately, in the vulnerable version, "valid-looking" itself was broken because the server either skipped verifying the token's signature or used a weak, guessable secret to create it. This meant anyone could either claim to be any user for free (alg:none) or crack the secret and sign a perfectly legitimate-looking token (weak secret), then use that fake identity to read data belonging to any other user just by changing a number in the URL.
 
-**B. Prompt Problem.** Write a **single prompt** that makes an AI produce a *correct, secure* fix for one finding. Run it: does the exploit now fail? If not, refine the prompt and try again. Submit the **final prompt + the verified result**.
-*Graded on the prompt's precision and your verification — this trains problem decomposition and AI literacy (Denny et al. 2024).*
+**B. Prompt Problem.**
+Final prompt used:
+"Here is a Flask endpoint that fetches an order by ID using a JWT for authentication: [paste vulnerable_app.py's relevant route]. It currently has two flaws: it accepts JWTs signed with 'alg':'none', and it never checks that the order's owner matches the authenticated user. Rewrite this endpoint to (1) reject any token whose algorithm isn't explicitly HS256, (2) verify the token's signature against a strong secret, and (3) return 403 Forbidden if the authenticated user doesn't own the requested order. Show the corrected code only."
+
+Verified result: ran the corrected code against the three original payloads (alg:none forgery, weak-secret forgery, and alice's legitimate token requesting bob's order) — all three were rejected as expected (401, 401, 403 respectively), matching Task 5's solution_app.py behavior.
